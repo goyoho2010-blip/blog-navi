@@ -782,54 +782,118 @@ elif page=='공식자료·근거 검증':
         else:st.info('공식 문서를 업로드하면 근거 대조 기능이 활성화됩니다. 이미지 스캔 PDF는 텍스트 추출이 되지 않을 수 있습니다.')
 
 elif page=='원고 편집·검수':
-    if not posts:st.info('먼저 원고를 만드세요.')
+    st.header('원고 편집 → 수정 완료·저장 → 최신 원고 재검증 → 최종 승인')
+    st.caption('원고 저장과 게시 승인을 분리했습니다. 검수 오류가 있어도 수정 내용을 저장할 수 있으며, 검증을 통과하기 전에는 승인할 수 없습니다.')
+    if not posts:
+        st.info('먼저 콘텐츠 기획·생성에서 원고를 작성하세요.')
     else:
-        selected=st.selectbox('편집할 원고',posts,format_func=lambda p:f'#{p["id"]} [{p["status"]}] {p["title"]}')
+        selected=st.selectbox('편집할 원고',posts,format_func=lambda x:f'#{x["id"]} [{x["status"]}] {x["title"]}',key='v142_select_post')
         p=get_post(selected['id'])
-        with st.form(f'edit_{p["id"]}'):
+        pid=p['id']
+        st.markdown('### ① 문제 확인 및 원고 수정')
+        st.write('**현재 저장된 상태:** '+p['status'])
+        st.caption('검수 리포트와 위치 미리보기는 마지막으로 저장된 버전을 보여줍니다. 변경사항은 ② 수정 완료·저장 버튼을 누른 뒤 아래에 반영됩니다.')
+        with st.expander('현재 저장된 원고의 문제 문장과 수정 권고 (편집 전 확인)',expanded=True):
+            annotations=annotated_findings(p)
+            located=[f for f in annotations if f['locations']]
+            unlocated=[f for f in annotations if not f['locations']]
+            for item in located:
+                places=', '.join(str(x['line'])+'행' for x in item['locations'][:8])
+                st.write(f'**[{item["level"]}] {item["label"]} — {places}**')
+                st.caption('권장 조치: '+item['advice'])
+            if located:
+                st.markdown(annotated_html(p['body'],annotations),unsafe_allow_html=True)
+            else:
+                st.info('저장된 원고에서 자동으로 특정할 수 있는 오류 문구가 없습니다. 아래 추가 확인 사항도 점검하십시오.')
+            if unlocated:
+                st.markdown('**별도 조치가 필요한 항목**')
+                for item in unlocated:
+                    st.warning(item['message']+' — '+item['advice'])
+        # A version-specific form key ensures a saved revision is the default when the page reruns.
+        version=hashlib.sha256((p['body']+'|'+p['sources']+'|'+p['claims']+'|'+p['title']).encode('utf-8')).hexdigest()[:12]
+        with st.form(f'edit_v142_{pid}_{version}'):
             title=st.text_input('제목',value=p['title'])
             topic=st.text_input('주제',value=p['topic'])
             channel=st.selectbox('채널',list(BRANDS),index=list(BRANDS).index(p['channel']) if p['channel'] in BRANDS else 0)
             keywords=st.text_input('키워드',value=p['keywords'])
-            body=st.text_area('원고 본문',value=p['body'],height=460)
+            body=st.text_area('원고 본문 (직접 수정)',value=p['body'],height=460)
             sources=st.text_area('근거: 기관·문서명·URL·확인일',value=p['sources'],height=120)
-            claims=st.text_area('수동 사실확인 기록 (필수)',value=p['claims'],height=150,help='예: 대학명, 모집요강 학년도, 페이지, 확인한 수치, 확인한 날짜. 사실 검증 여부를 담당자가 기록합니다.')
-            status=st.selectbox('작업 단계',STATUS,index=STATUS.index(p['status']) if p['status'] in STATUS else 0)
-            submitted=st.form_submit_button('검수 후 저장',type='primary')
-            if submitted:
-                updated={'title':title,'topic':topic,'channel':channel,'keywords':keywords,'body':body,'sources':sources,'claims':claims,'status':status,'publish_at':p['publish_at'],'published_url':p['published_url']}
-                updated['id']=p['id']
-                problems=check(updated)
-                if status in ['승인','예약 등록','게시 완료'] and any(level=='차단' for level,_ in problems):
-                    st.error('차단 항목이 있어 승인할 수 없습니다. 수정 또는 사실검증 기록이 필요합니다.')
-                    for level,msg in problems:st.write(f'- [{level}] {msg}')
-                else:save(updated,p['id']);st.success('저장되었습니다.');st.rerun()
-        st.markdown('#### 원고 문제 위치 표시 · 수정 안내 (v1.4.1)')
-        st.caption('노란색은 수정 또는 확인이 필요한 원고의 실제 표현입니다. 아래는 위치 확인용 미리보기이며, 수정은 위 「원고 본문」 입력창에서 진행하세요.')
-        annotations=annotated_findings(p)
-        located=[f for f in annotations if f['locations']]
-        unlocated=[f for f in annotations if not f['locations']]
-        if located:
-            for item in located:
-                places=', '.join(str(x['line'])+'행' for x in item['locations'][:8])
-                with st.expander(f'[{item["level"]}] {item["label"]} — {places}',expanded=True):
-                    st.write('**점검 사유:** '+item['message'])
-                    st.write('**권장 조치:** '+item['advice'])
-                    for loc in item['locations'][:8]:st.code(f'{loc["line"]}행: {loc["excerpt"]}',language=None)
-            st.markdown('##### 원고 전체 미리보기 (문제 표현 강조)')
-            st.markdown(annotated_html(p['body'],annotations),unsafe_allow_html=True)
-        else:st.info('원고에서 정규식 또는 정확한 문구로 특정할 수 있는 문제 위치가 없습니다.')
-        if unlocated:
-            st.markdown('##### 위치 자동 지정 불가 · 별도 조치 필요')
-            for item in unlocated:
-                st.warning(f'**{item["label"]}** — {item["message"]}\n\n{item["advice"]}')
-        st.caption('AI 주장과 원고 문장이 정확히 일치하지 않으면 잘못된 위치를 표시하지 않습니다. 원문 출처 부족·수동 사실확인 누락은 문장 수정이 아니라 자료/기록 추가로 해결해야 합니다.')
-        st.markdown('#### 검수 리포트 (자동형식 점검)')
-        for level,msg in check(p):
+            claims=st.text_area('수동 사실확인 기록',value=p['claims'],height=150,help='확인한 공식 자료명·학년도·페이지·수치·확인일을 기입합니다. 저장 시에는 비어 있어도 됩니다. 최종 승인할 때는 필수입니다.')
+            col_draft,col_done=st.columns(2)
+            with col_draft: save_draft=st.form_submit_button('임시 저장',use_container_width=True)
+            with col_done: save_done=st.form_submit_button('수정 완료·저장',type='primary',use_container_width=True)
+        if save_draft or save_done:
+            updated=dict(p)
+            updated.update({'title':title,'topic':topic,'channel':channel,'keywords':keywords,'body':body,'sources':sources,'claims':claims})
+            substantive=any(updated[k]!=p.get(k) for k in ('title','topic','channel','keywords','body','sources','claims'))
+            if substantive:
+                updated['status']='작성 중' if save_draft else '검수 대기'
+            elif save_done and p['status'] not in ['승인','예약 등록','게시 완료']:
+                updated['status']='검수 대기'
+            if not updated['title'].strip() or not updated['body'].strip():
+                st.error('제목과 본문은 비워 둘 수 없습니다. 내용을 입력한 후 저장하세요.')
+            else:
+                if substantive:
+                    with conn() as c:
+                        c.execute('INSERT INTO revision_audit(post_id,previous_body,proposed_body,base_body_hash,evidence_hash,revision_notes,accepted_at) VALUES(?,?,?,?,?,?,?)',
+                                  (pid,p['body'],updated['body'],body_hash(p['body']),evidence_digest(pid),'수동 편집: '+('임시 저장' if save_draft else '수정 완료·저장'),now()))
+                save(updated,pid)
+                st.session_state[f'v142_saved_{pid}']='저장 성공! 현재 원고가 반영되었습니다. 변경된 내용은 재검증 후 승인할 수 있습니다.'
+                st.rerun()
+        if st.session_state.get(f'v142_saved_{pid}'):
+            st.success(st.session_state.pop(f'v142_saved_{pid}'))
+        st.markdown('### ② 저장된 최신 원고 확인')
+        with st.expander('저장된 최신 원고 전체 보기',expanded=False):
+            st.text_area('저장된 원고 (읽기 전용)',value=p['body'],height=320,disabled=True,key=f'v142_saved_body_{pid}_{version}')
+        st.caption('원고 본문을 수정한 뒤 반드시 위의 「수정 완료·저장」을 눌러야 이 미리보기가 바뀝니다. 저장 완료 전에는 재검증하지 마세요.')
+        st.markdown('### ③ 최신 원고 재검증')
+        findings=check(p)
+        blocking=[msg for level,msg in findings if level=='차단']
+        st.write(f'**현재 저장본의 차단 항목: {len(blocking)}건**')
+        for level,msg in findings:
             if level=='차단':st.error(msg)
             elif level=='주의':st.warning(msg)
             else:st.success(msg)
-        st.caption('자동 점검은 사실 검증을 대신하지 않습니다. 출처의 실재성·원문과 수치 일치는 담당자가 확인해야 합니다.')
+        docs=evidence_for(pid)
+        if not docs:
+            st.info('공식자료·근거 검증 메뉴에서 공식 PDF 또는 URL 원문을 먼저 등록하세요.')
+        else:
+            st.caption(f'등록된 공식 원문: {len(docs)}건. AI 검증은 저장된 최신 원고를 대상으로 실행됩니다.')
+            verification_model=st.text_input('재검증 AI 모델',value='gpt-4.1-mini',key=f'v142_verify_model_{pid}')
+            if st.button('최신 저장 원고로 AI 근거 재검증',type='primary',key=f'v142_reverify_{pid}'):
+                try:
+                    with st.spinner('저장된 최신 원고와 공식 원문을 비교합니다...'):
+                        verify_ai(pid,verification_model)
+                    st.session_state[f'v142_verified_{pid}']='최신 원고의 AI 검증 보고서를 저장했습니다. 아래 검수 조건을 다시 확인하세요.'
+                    st.rerun()
+                except Exception as e:st.error('재검증 실패: '+str(e))
+            if st.session_state.get(f'v142_verified_{pid}'):
+                st.success(st.session_state.pop(f'v142_verified_{pid}'))
+            report=latest_report(pid)
+            if report:
+                report_data=json.loads(report['report'])
+                current_report=(report['evidence_hash']==evidence_digest(pid) and report_data.get('_source_body_hash')==body_hash(p['body']))
+                st.write('**최근 검증 시각:** '+report['verified_at']+' / '+('현재 원고 기준' if current_report else '이전 원고 기준 — 재검증 필요'))
+                if current_report:
+                    rows=[{'주장':x.get('claim',''),'판정':x.get('verdict',''),'근거문서':x.get('document',''),'근거 인용':x.get('evidence_quote',''),'페이지':x.get('page',''),'권고':x.get('guidance','')} for x in report_data.get('claims',[])]
+                    if rows:st.dataframe(rows,hide_index=True,use_container_width=True)
+        st.markdown('### ④ 최종 검수 승인')
+        if p['status'] in ('승인','예약 등록','게시 완료') and not blocking:
+            st.success('이미 승인된 최신 원고입니다. 예약 발행 지원 메뉴에서 다음 단계를 진행하세요.')
+        else:
+            confirmation=st.checkbox('등록한 공식 원문의 진위·학년도·인용 페이지·핵심 수치를 직접 확인했고, 검수 리포트의 차단 항목이 없음을 확인했습니다.',key=f'v142_approve_confirm_{pid}_{version}')
+            if blocking:st.info('현재 승인 불가: 위 차단 항목을 먼저 해결하십시오. 단, 원고 수정 및 임시 저장은 언제나 가능합니다.')
+            if st.button('최종 검수 승인',disabled=bool(blocking) or not confirmation,key=f'v142_approve_{pid}',type='primary'):
+                latest=get_post(pid)
+                if check(latest) and any(level=='차단' for level,_ in check(latest)):
+                    st.error('최신 원고에 승인 차단 항목이 발견되었습니다. 재검증 후 다시 시도하세요.')
+                elif latest['body']!=p['body'] or latest['sources']!=p['sources'] or latest['claims']!=p['claims']:
+                    st.error('원고가 변경되었습니다. 다시 확인한 뒤 승인하세요.')
+                else:
+                    latest['status']='승인';save(latest,pid)
+                    st.success('최종 검수 승인이 완료되었습니다. 예약 발행 지원 메뉴로 이동하세요.')
+                    st.rerun()
+        st.caption('승인은 실제 네이버·티스토리 자동 게시를 의미하지 않습니다. 플랫폼 편집기에서 별도 예약 등록해야 합니다.')
 
 elif page=='예약 발행 지원':
     eligible=[p for p in posts if p['status'] in ['승인','예약 등록','게시 완료']]
