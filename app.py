@@ -52,7 +52,7 @@ def load_api_key():
     try: return st.secrets.get('OPENAI_API_KEY','') or os.getenv('OPENAI_API_KEY','')
     except Exception: return os.getenv('OPENAI_API_KEY','')
 
-# v1.2: official-domain-only Responses API web search + link-only sources registry.
+# v1.2.1: compatibility-aware Responses web search + official URL post-filtering.
 # A search result is a lead, NOT proof that the cited page is current or authoritative.
 OFFICIAL_DOMAINS=('moe.go.kr','kcue.or.kr','adiga.kr','kice.re.kr','sen.go.kr','go.kr','ac.kr')
 # API domain filtering accepts apex names and includes subdomains.
@@ -77,26 +77,43 @@ def search_official(query,model='gpt-4.1-mini'):
     key=load_api_key()
     if not key:raise ValueError('OPENAI_API_KEY를 먼저 등록해 주세요.')
     if not query.strip():raise ValueError('검색할 주제를 입력하세요.')
-    data={'model':model,'tools':[{'type':'web_search','filters':{'allowed_domains':SEARCH_DOMAINS},'search_context_size':'medium'}], 'tool_choice':'required',
-          'instructions':'한국 대학입시 공식 문서 검색 보조원입니다. 검색에서 찾은 자료의 제목, 발행기관, 발표연도와 용도만 설명합니다. 확인되지 않은 모집인원, 전형자료, PDF 내용은 만들어내지 마세요. 공식자료 링크를 찾지 못하면 없다고 말하세요. 검색된 문서가 최신 모집요강인지 단정하지 않습니다.',
-          'input':f'공식자료 검색 주제: {query[:350]}\n교육부, 대교협, 대입정보포털, 평가원 및 대학 입학처의 공식 발표문과 시행계획 원문을 우선 검색하십시오. 관련 학년도와 자료 종류를 구별하십시오.',
+    # gpt-4.1-mini can reject tool.filters even though the web_search tool itself works.
+    # For that model, search without filters; ALWAYS post-filter returned source URLs.
+    tool={'type':'web_search','search_context_size':'medium'}
+    if model.strip() not in ('gpt-4.1-mini',):
+        tool['filters']={'allowed_domains':SEARCH_DOMAINS}
+    data={'model':model,'tools':[tool], 'tool_choice':'required',
+          'instructions':'한국 대학입시 공식 문서 검색 보조원입니다. 교육부, 정부, 대교협, 대입정보포털, 평가원, 대학 입학처의 공식 사이트에서만 자료를 찾으세요. 검색에서 찾은 자료의 제목, 발행기관, 발표연도와 용도만 설명합니다. 확인되지 않은 모집인원, 전형자료, PDF 내용은 만들어내지 마세요. 공식자료 링크를 찾지 못하면 없다고 말하세요. 검색된 문서가 최신 모집요강인지 단정하지 않습니다.',
+          'input':f'공식자료 검색 주제: {query[:350]}\nsite:moe.go.kr OR site:go.kr OR site:ac.kr OR site:kcue.or.kr OR site:adiga.kr OR site:kice.re.kr 공식 발표문, 시행계획과 원문을 우선 검색하십시오. 관련 학년도와 자료 종류를 구별하십시오.',
           'include':['web_search_call.action.sources'],'max_output_tokens':1400}
-    r=requests.post('https://api.openai.com/v1/responses',headers={'Authorization':f'Bearer {key}','Content-Type':'application/json'},json=data,timeout=120)
+    headers={'Authorization':f'Bearer {key}','Content-Type':'application/json'}
+    r=requests.post('https://api.openai.com/v1/responses',headers=headers,json=data,timeout=120)
+    # Some models/API routes do not accept domain filters. Retry once without filters.
+    # The visible source list still enforces an official-domain allowlist afterwards.
+    if r.status_code==400 and 'filters' in tool:
+        try: err=r.json().get('error',{})
+        except ValueError: err={}
+        if err.get('param')=='tools' and ('filters' in err.get('message','').lower()):
+            tool.pop('filters',None)
+            r=requests.post('https://api.openai.com/v1/responses',headers=headers,json=data,timeout=120)
     if not r.ok:raise RuntimeError(f'공식 검색 API 오류 {r.status_code}: {r.text[:350]}')
     res=r.json(); results={}
-    # Only citations and tool-reported source URLs are accepted, not AI-invented URLs in generated prose.
+    # Only tool-reported sources and URL citations accepted; NEVER generated URLs in prose.
     for item in res.get('output',[]):
         if item.get('type')=='web_search_call':
             for source in (item.get('action') or {}).get('sources',[]) or []:
                 url=source.get('url','');title=source.get('title','')
-                if official_hostname(url):results.setdefault(url,{'url':url,'title':title or url,'domain':official_hostname(url)})
+                host=official_hostname(url)
+                if host:results.setdefault(url,{'url':url,'title':title or url,'domain':host})
         if item.get('type')=='message':
             for content in item.get('content',[]):
                 for ann in content.get('annotations',[]) or []:
                     if ann.get('type')=='url_citation':
                         url=ann.get('url','');title=ann.get('title','')
-                        if official_hostname(url):results.setdefault(url,{'url':url,'title':title or url,'domain':official_hostname(url)})
-    return {'query':query,'summary':response_text(res),'results':list(results.values())[:30],'searched_at':now()}
+                        host=official_hostname(url)
+                        if host:results.setdefault(url,{'url':url,'title':title or url,'domain':host})
+    return {'query':query,'summary':response_text(res),'results':list(results.values())[:30],
+            'searched_at':now(),'domain_filter_applied':bool(tool.get('filters'))}
 
 def extract_official_url(url):
     # Strict host allowlist prevents arbitrary user-provided URL fetching.
@@ -381,7 +398,7 @@ elif page=='콘텐츠 기획·생성':
 
 elif page=='공식 출처 자동 검색':
     st.subheader('공식 출처 자동 검색 · 원문 등록')
-    st.info('OpenAI 웹 검색을 교육부·대교협·평가원·대학 공식 도메인으로 제한합니다. 검색 결과는 후보 출처이며, AI가 공식 문서의 최신성·진위를 보증하는 것은 아닙니다.')
+    st.info('검색 모델이 filters 옵션을 지원하면 검색 단계부터 공식 도메인으로 제한합니다. 지원하지 않으면 검색된 출처 목록에서 공식 도메인 URL만 선별합니다. 검색 요약은 미검증이며, 링크의 최신성·진위를 보증하지 않습니다.')
     query=st.text_input('공식 자료 검색어',value='2028학년도 대학입시제도 개편 확정안 교육부')
     model=st.text_input('검색 AI 모델',value='gpt-4.1-mini',key='search_model')
     if st.button('공식 출처 자동 검색',type='primary'):
@@ -392,7 +409,8 @@ elif page=='공식 출처 자동 검색':
     search=st.session_state.get('official_search_results')
     if search:
         st.caption(f'검색어: {search["query"]} / 검색 실행: {search["searched_at"]}')
-        with st.expander('AI 검색 요약 및 인용',expanded=False):st.markdown(search['summary'])
+        st.caption('검색 단계 도메인 제한: '+('사용' if search.get('domain_filter_applied') else '미사용(결과 URL만 공식 도메인으로 선별)'))
+        with st.expander('AI 검색 요약 (미검증)',expanded=False):st.markdown(search['summary'])
         results=search['results']
         if not results:
             st.warning('공식 도메인에 해당하는 출처 URL을 확보하지 못했습니다. 검색어를 바꾸거나 PDF를 직접 업로드해 주세요.')
