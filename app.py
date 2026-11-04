@@ -405,6 +405,77 @@ def check(post):
     if not findings:add('통과','형식·기본 검수 조건을 충족합니다. 내용의 진위는 담당자가 원문 대조해야 합니다.')
     return findings
 
+# v1.4.1: actionable source-aware findings, with locations in the original draft.
+def annotated_findings(post):
+    """Return line-aware findings. Never invent a position if text cannot be matched."""
+    body=post.get('body','') or ''
+    found=[]
+    def add(label, message, pattern=None, advice='', exact=None, level='차단'):
+        matches=[]
+        if exact:
+            idx=body.find(exact)
+            if idx >= 0: matches=[(idx,idx+len(exact))]
+        elif pattern:
+            matches=[(m.start(),m.end()) for m in re.finditer(pattern,body,re.I|re.S)][:20]
+        loc=[]
+        for a,b in matches:
+            line=body.count('\n',0,a)+1
+            loc.append({'start':a,'end':b,'line':line,'excerpt':body[a:b][:260]})
+        found.append({'label':label,'message':message,'locations':loc,'advice':advice,'level':level})
+    for pat,label,advice in [
+        (r'\[[^\]\n]{0,180}(?:확인 필요|기록하세요|여기에)[^\]\n]{0,180}\]', '검증용 문구', '해당 문장을 공식 자료로 확인한 뒤 구체적인 사실로 교체하거나 삭제하세요.'),
+        (r'선택형 문제|선택과목 체제.{0,35}강화|선택과목.{0,35}유지', '2028 수능 선택과목', '2028학년도 국어·수학·탐구의 선택과목 폐지 여부를 공식자료와 대조하세요.'),
+        (r'(?:자기소개서|자소서)[^\n.!?]{0,45}(?:관리|준비|작성|제출)', '대입 자기소개서', '대입 자기소개서 폐지 이후 제도와 맞는 표현인지 확인하고 수정하세요.'),
+        (r'(?:고1[^\n.!?]{0,18}2028|2028[^\n.!?]{0,30}고1)', '대입 대상 학년', '원고 작성 시점의 고1과 2028학년도 대입 대상 학년이 일치하는지 확인하세요.'),
+    ]:
+        if label=='2028 수능 선택과목' and '2028' not in body:continue
+        if label=='대입 대상 학년' and '2028' not in body:continue
+        if label=='대입 자기소개서' and not re.search(r'학생부종합전형|학종',body):continue
+        if re.search(pat,body,re.I|re.S):add(label,label+' 관련 본문을 검토하세요.',pat,advice)
+    if re.search(r'확정|전원 합격|100%|무조건|반드시 합격',body):
+        add('확정·과장 표현','확정적 표현이 있습니다. 법령·공식 확정사항인지 문맥을 점검하세요.',r'확정|전원 합격|100%|무조건|반드시 합격','근거가 뚜렷한 확정사항은 유지하고, 근거 없는 단정·과장만 수정하세요.',level='주의')
+    pid=post.get('id')
+    if pid:
+        report_row=latest_report(pid)
+        if report_row:
+            data=json.loads(report_row['report'])
+            current=data.get('_source_body_hash')==body_hash(body) and report_row['evidence_hash']==evidence_digest(pid)
+            if current:
+                for i,c in enumerate(data.get('claims',[]),1):
+                    if c.get('verdict') not in ('불일치','근거부족'):continue
+                    claim=str(c.get('claim','')).strip()
+                    # Require literal phrase match. Fuzzy matches would risk pointing to the wrong claim.
+                    add('AI 검증 주장 '+str(i)+' · '+str(c.get('verdict')),
+                        claim,exact=claim,advice=str(c.get('guidance') or '공식 원문 근거를 확인하고 수정하거나 삭제하세요.'))
+            else:
+                found.append({'label':'AI 보고서 재검증 필요','message':'검증 시점 이후 원고 또는 근거가 변경됐습니다.', 'locations':[], 'advice':'현재 원고로 AI 근거 대조를 다시 실행하세요. 기존 판정 위치는 표시하지 않습니다.','level':'차단'})
+    return found
+
+def annotated_html(body, findings):
+    """Escaped HTML preview only; not an editable field, never embeds arbitrary HTML."""
+    spans=[]
+    for item in findings:
+        for x in item['locations']:
+            spans.append((x['start'],x['end'],item['label']))
+    spans.sort(key=lambda x:(x[0],-(x[1]-x[0])))
+    merged=[]
+    for a,b,label in spans:
+        if merged and a<merged[-1][1]:
+            # Overlapping markings are one highlight with combined issue labels.
+            pa,pb,labels=merged[-1]
+            merged[-1]=(pa,max(pb,b),labels+[label] if label not in labels else labels)
+        else:merged.append((a,b,[label]))
+    output=[];pos=0
+    for a,b,labels in merged:
+        output.append(html.escape(body[pos:a]))
+        title=html.escape(' / '.join(labels),quote=True)
+        output.append('<mark title="'+title+'" style="background:#ffe08a;color:#171717;border-radius:3px;padding:1px 2px">'+html.escape(body[a:b])+'</mark>')
+        pos=b
+    output.append(html.escape(body[pos:]))
+    text=''.join(output)
+    lines=text.split('\n')
+    return '<div style="background:#1a202b;color:#f5f6f8;border:1px solid #596375;border-radius:8px;padding:12px;max-height:530px;overflow:auto;font-size:14px;line-height:1.9;font-family:inherit">'+''.join(f'<div id="draft-line-{i}" style="display:flex;gap:12px;border-bottom:1px solid #ffffff12"><span style="min-width:32px;text-align:right;color:#9da8b8;user-select:none">{i}</span><span style="white-space:pre-wrap;overflow-wrap:anywhere">{line if line else "&nbsp;"}</span></div>' for i,line in enumerate(lines,1))+'</div>'
+
 def html_export(post):
     text=post['body']
     lines=[]
@@ -733,6 +804,26 @@ elif page=='원고 편집·검수':
                     st.error('차단 항목이 있어 승인할 수 없습니다. 수정 또는 사실검증 기록이 필요합니다.')
                     for level,msg in problems:st.write(f'- [{level}] {msg}')
                 else:save(updated,p['id']);st.success('저장되었습니다.');st.rerun()
+        st.markdown('#### 원고 문제 위치 표시 · 수정 안내 (v1.4.1)')
+        st.caption('노란색은 수정 또는 확인이 필요한 원고의 실제 표현입니다. 아래는 위치 확인용 미리보기이며, 수정은 위 「원고 본문」 입력창에서 진행하세요.')
+        annotations=annotated_findings(p)
+        located=[f for f in annotations if f['locations']]
+        unlocated=[f for f in annotations if not f['locations']]
+        if located:
+            for item in located:
+                places=', '.join(str(x['line'])+'행' for x in item['locations'][:8])
+                with st.expander(f'[{item["level"]}] {item["label"]} — {places}',expanded=True):
+                    st.write('**점검 사유:** '+item['message'])
+                    st.write('**권장 조치:** '+item['advice'])
+                    for loc in item['locations'][:8]:st.code(f'{loc["line"]}행: {loc["excerpt"]}',language=None)
+            st.markdown('##### 원고 전체 미리보기 (문제 표현 강조)')
+            st.markdown(annotated_html(p['body'],annotations),unsafe_allow_html=True)
+        else:st.info('원고에서 정규식 또는 정확한 문구로 특정할 수 있는 문제 위치가 없습니다.')
+        if unlocated:
+            st.markdown('##### 위치 자동 지정 불가 · 별도 조치 필요')
+            for item in unlocated:
+                st.warning(f'**{item["label"]}** — {item["message"]}\n\n{item["advice"]}')
+        st.caption('AI 주장과 원고 문장이 정확히 일치하지 않으면 잘못된 위치를 표시하지 않습니다. 원문 출처 부족·수동 사실확인 누락은 문장 수정이 아니라 자료/기록 추가로 해결해야 합니다.')
         st.markdown('#### 검수 리포트 (자동형식 점검)')
         for level,msg in check(p):
             if level=='차단':st.error(msg)
