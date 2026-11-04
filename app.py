@@ -52,7 +52,7 @@ def load_api_key():
     try: return st.secrets.get('OPENAI_API_KEY','') or os.getenv('OPENAI_API_KEY','')
     except Exception: return os.getenv('OPENAI_API_KEY','')
 
-# v1.2.1: compatibility-aware Responses web search + official URL post-filtering.
+# v1.3: official-page attachment discovery + source review flow.
 # A search result is a lead, NOT proof that the cited page is current or authoritative.
 OFFICIAL_DOMAINS=('moe.go.kr','kcue.or.kr','adiga.kr','kice.re.kr','sen.go.kr','go.kr','ac.kr')
 # API domain filtering accepts apex names and includes subdomains.
@@ -142,6 +142,52 @@ def extract_official_url(url):
     else:raise ValueError('PDF/HTML 원문을 읽을 수 없습니다. 공식 파일을 다운로드하여 업로드하세요.')
     if len(text.strip())<150:raise ValueError('본문 추출량이 적습니다. 첨부파일 또는 스캔 PDF를 직접 업로드하세요.')
     return {'text':text[:1500000],'pages':pages,'kind':kind,'sha256':hashlib.sha256(raw).hexdigest(),'size':len(raw)}
+
+def discover_official_documents(url):
+    """Find plausible PDF attachment links on one verified official HTML page.
+
+    Discovery is not document verification. All returned URLs must pass the same
+    official-host validation; redirects are not followed. The user selects a URL.
+    """
+    host=official_hostname(url)
+    if not host:raise ValueError('공식 HTTPS 주소만 확인할 수 있습니다.')
+    headers={'User-Agent':'BlogNAVI/1.3 (educational document review)','Accept':'text/html,application/pdf'}
+    response=requests.get(url,headers=headers,timeout=(8,25),allow_redirects=False,stream=True)
+    try:
+        if 300<=response.status_code<400:raise ValueError('이 주소는 다른 사이트로 이동합니다. 최종 공식 URL을 직접 확인해 입력하세요.')
+        if not response.ok:raise ValueError(f'페이지 요청 실패 ({response.status_code}). PDF를 수동 업로드해 주세요.')
+        content_length=int(response.headers.get('Content-Length','0') or 0)
+        if content_length>4*1024*1024:raise ValueError('페이지가 4MB를 초과합니다. PDF를 직접 업로드하세요.')
+        chunks=io.BytesIO()
+        for chunk in response.iter_content(chunk_size=65536):
+            chunks.write(chunk)
+            if chunks.tell()>4*1024*1024:raise ValueError('페이지가 4MB를 초과합니다.')
+        raw=chunks.getvalue()
+        if raw[:4]==b'%PDF' or 'application/pdf' in response.headers.get('Content-Type','').lower():
+            return {'direct_pdf':True,'candidates':[{'title':'현재 주소의 PDF 원문','url':url,'kind':'PDF'}]}
+        typ=response.headers.get('Content-Type','').lower()
+        if 'text/html' not in typ and b'<html' not in raw[:1500].lower() and b'<!doctype html' not in raw[:1500].lower():
+            raise ValueError('HTML/PDF 문서가 아닙니다. 공식 파일을 수동 업로드해 주세요.')
+        soup=BeautifulSoup(raw,'html.parser')
+        candidates=[];seen=set()
+        for element in soup.find_all('a',href=True):
+            href=element.get('href','').strip()
+            if not href or href.startswith(('#','javascript:','mailto:','data:')):continue
+            candidate=urljoin(url,href)
+            if not official_hostname(candidate):continue
+            # Exclude ordinary navigation. Recognize file-looking paths and official attachment endpoints.
+            parsed=urlparse(candidate)
+            path=(parsed.path+'?'+parsed.query).lower()
+            label=element.get_text(' ',strip=True)[:150]
+            looks_pdf=('.pdf' in path or '.pdf' in label.lower())
+            looks_download=(any(x in path for x in ('download','filedown','file_down','attach','atchfile','downfile','fileview','fileview.do')) and bool(label))
+            if not (looks_pdf or looks_download):continue
+            if candidate in seen:continue
+            seen.add(candidate)
+            candidates.append({'title':label or '첨부 파일','url':candidate,'kind':'PDF 후보' if looks_pdf else '첨부파일 후보'})
+            if len(candidates)>=30:break
+        return {'direct_pdf':False,'candidates':candidates}
+    finally:response.close()
 
 def save_url_evidence(pid,url,document_title,organization,checked_at):
     doc=extract_official_url(url)
@@ -280,7 +326,7 @@ def check(post):
     if not post.get('title','').strip():add('차단','제목이 없습니다.')
     for issue in guarded_issues(body):add('차단',issue)
     docs=evidence_for(post.get('id',0)) if post.get('id') else []
-    if not docs:add('차단','공식 원문 PDF/TXT 업로드가 없습니다. 공식자료·근거 검증 메뉴에서 자료를 등록하세요.')
+    if not docs:add('차단','등록된 공식 원문이 없습니다. 공식 URL을 자동 수집하거나 PDF/TXT를 업로드하세요.')
     report=latest_report(post.get('id',0)) if post.get('id') else None
     if not report:add('차단','원문 대조 AI 보고서가 없습니다.')
     elif report['evidence_hash']!=evidence_digest(post['id']):add('차단','원문 자료가 변경되어 검증 보고서를 다시 생성해야 합니다.')
@@ -362,7 +408,7 @@ else:
     st.stop()
 
 st.title('🧭 블로그 NAVI')
-st.caption('천명의선택 · 공식자료 자동 검색 → URL/PDF 원문 등록 → AI 근거 기반 원고 → 검증 → 승인 → 예약 발행 지원 · v1.2')
+st.caption('천명의선택 · 공식자료 자동 검색 → URL/PDF 첨부 자동 수집 → AI 근거 기반 원고 → 검증 → 승인 → 예약 발행 지원 · v1.3')
 page=st.sidebar.radio('관리 메뉴',['대시보드','콘텐츠 기획·생성','공식 출처 자동 검색','공식자료·근거 검증','원고 편집·검수','예약 발행 지원','성과 분석','설정·백업'])
 posts=all_posts()
 
@@ -450,13 +496,51 @@ elif page=='공식 출처 자동 검색':
             else:st.info('먼저 콘텐츠 기획·생성에서 원고를 하나 저장하면 공식 출처를 연결할 수 있습니다.')
 
 elif page=='공식자료·근거 검증':
-    st.subheader('공식 문서 업로드 · 원고-원문 근거 대조')
+    st.subheader('공식 URL/PDF 자동 수집 · 원고-원문 근거 대조 (v1.3)')
     st.warning('이 기능은 업로드 문서 내용과 원고를 AI가 비교하는 보조 검수입니다. 문서가 실제 공식 원문인지, 최신본인지 최종 판단은 담당자가 해야 합니다.')
     if not posts:st.info('먼저 콘텐츠 기획·생성에서 원고를 작성하세요.')
     else:
         target=st.selectbox('원문 검증 대상 원고',posts,format_func=lambda p:f'#{p["id"]} {p["title"]}')
         pid=target['id'];p=get_post(pid)
-        with st.expander('① 공식 PDF/TXT 원문 등록',expanded=True):
+        with st.expander('① 공식 URL 자동 수집 · 첨부 PDF 찾기 (v1.3)',expanded=True):
+            st.caption('교육부·대교협·대학 입학처의 공식 발표문 URL을 입력하면 페이지에서 PDF 첨부 링크를 찾아 보여줍니다. 검색된 링크를 직접 확인한 뒤 원고에 등록하십시오.')
+            entry_url=st.text_input('공식 발표문 또는 PDF URL',key=f'auto_url_{pid}',placeholder='https://www.moe.go.kr/...')
+            if st.button('URL에서 PDF 첨부 찾기',key=f'find_pdf_{pid}',disabled=not bool(entry_url.strip())):
+                try:
+                    with st.spinner('공식 페이지의 첨부파일 링크를 확인합니다...'):
+                        st.session_state[f'found_docs_{pid}']=discover_official_documents(entry_url.strip())
+                        st.session_state[f'found_docs_source_{pid}']=entry_url.strip()
+                except Exception as e:st.error(str(e))
+            found=st.session_state.get(f'found_docs_{pid}')
+            if found and entry_url.strip()!=st.session_state.get(f'found_docs_source_{pid}'):
+                st.info('URL이 변경되었습니다. 첨부 검색 버튼을 다시 누르세요.')
+            elif found:
+                candidates=found['candidates']
+                if candidates:
+                    idx=st.selectbox('등록할 파일 또는 문서 선택',list(range(len(candidates))),format_func=lambda i:f'{candidates[i]["kind"]} | {candidates[i]["title"][:90]}',key=f'found_choice_{pid}')
+                    selected=candidates[idx]
+                    st.code(selected['url'],language=None)
+                    st.link_button('선택한 원문 새 창에서 확인',selected['url'],key=f'open_found_{pid}')
+                    st.warning('첨부파일 후보가 HWP·HWPX 등일 수 있으며, PDF/HTML이 아니면 자동 분석하지 않습니다. 원문 제목·학년도와 내용이 일치하는지 확인하세요.')
+                else:
+                    selected={'url':entry_url.strip(),'title':'공식 페이지 본문','kind':'HTML 원문'}
+                    st.info('PDF 첨부 링크를 찾지 못했습니다. 현재 HTML 페이지 본문 읽기를 시도하거나 PDF를 수동 업로드할 수 있습니다.')
+                auto_name=st.text_input('원문 문서명 (직접 확인)',key=f'auto_docname_{pid}',placeholder='예: 2028 대학입시제도 개편 확정안')
+                auto_org=st.text_input('발행기관 (직접 확인)',key=f'auto_org_{pid}',placeholder='교육부')
+                auto_checked=st.date_input('원문 확인일',value=date.today(),key=f'auto_date_{pid}')
+                if st.button('선택한 공식 URL 원문 분석 · 등록',type='primary',key=f'auto_register_{pid}',disabled=not (auto_name.strip() and auto_org.strip())):
+                    try:
+                        with st.spinner('원문 텍스트를 추출하고 있습니다...'):
+                            ok,doc=save_url_evidence(pid,selected['url'],auto_name.strip(),auto_org.strip(),auto_checked.isoformat())
+                        if ok:
+                            post=get_post(pid);post['status']='검수 대기'
+                            line=f'{auto_org.strip()} | {auto_name.strip()} | {selected["url"]} | 확인일 {auto_checked.isoformat()}'
+                            if selected['url'] not in post['sources']:post['sources']=(post['sources'].strip()+'\n'+line).strip()
+                            save(post,pid)
+                        st.success(('원문 등록 완료' if ok else '같은 원문이 이미 등록되었습니다.')+f' / {doc["kind"]}, {doc["pages"]}쪽, {len(doc["text"]):,}자')
+                        st.rerun()
+                    except Exception as e:st.error(str(e))
+        with st.expander('② 공식 PDF/TXT 직접 업로드 (자동 수집 실패 시)',expanded=False):
             uploaded=st.file_uploader('공식 문서 PDF 또는 텍스트 파일',type=['pdf','txt'],key=f'doc_{pid}')
             doc_title=st.text_input('문서명',placeholder='예: 2028 대학입시제도 개편 확정안',key=f'doctitle_{pid}')
             organization=st.text_input('발행 기관',placeholder='교육부 / 대교협 / ○○대학교 입학처',key=f'org_{pid}')
@@ -482,7 +566,7 @@ elif page=='공식자료·근거 검증':
                         with conn() as c:c.execute('DELETE FROM evidence WHERE id=? AND post_id=?',(d['id'],pid))
                         p['status']='검수 대기';save(p,pid)
                         st.rerun()
-            st.markdown('#### ② 공식자료 발췌 기반 원고 생성')
+            st.markdown('#### ③ 공식자료 발췌 기반 원고 생성')
             st.caption('등록된 최대 4개 문서의 앞부분 각 18,000자를 AI에 전달합니다. 전체 문서 검증이 아니며, 생성 뒤 반드시 원고 대조 검사를 다시 실행해야 합니다.')
             grounded_model=st.text_input('근거 기반 작성 모델',value='gpt-4.1-mini',key=f'grounded_model_{pid}')
             if st.button('등록 문서로 AI 원고 재작성',key=f'grounded_make_{pid}'):
@@ -497,7 +581,7 @@ elif page=='공식자료·근거 검증':
                     p['body']=st.session_state[f'grounded_draft_edit_{pid}'];p['status']='검수 대기';save(p,pid)
                     st.session_state.pop(f'grounded_draft_{pid}',None)
                     st.success('원고를 교체했습니다. 아래 AI 근거 대조를 다시 실행하세요.');st.rerun()
-            st.markdown('#### ③ AI 근거 대조')
+            st.markdown('#### ④ AI 근거 대조')
             model=st.text_input('검증 모델',value='gpt-4.1-mini',key='verify_model')
             if st.button('원고와 문서 대조 · 검증 보고서 작성',type='primary'):
                 try:
